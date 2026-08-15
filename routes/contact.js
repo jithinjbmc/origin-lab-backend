@@ -1,5 +1,4 @@
 const express = require("express");
-const nodemailer = require("nodemailer");
 
 const router = express.Router();
 
@@ -37,22 +36,20 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ error: "Please provide a valid email address." });
     }
 
-    const transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS, // Gmail App Password, not your normal password
+    const toAddress = process.env.CONTACT_TO_EMAIL;
+
+    const resendResponse = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        "Content-Type": "application/json",
       },
-    });
-
-    const toAddress = process.env.CONTACT_TO_EMAIL || process.env.EMAIL_USER;
-
-    await transporter.sendMail({
-      from: `"ORIGIN Lab Website" <${process.env.EMAIL_USER}>`,
-      to: toAddress,
-      replyTo: email,
-      subject: `[ORIGIN Lab Contact] ${subject || inquiryType || "New inquiry"} — from ${name}`,
-      text: `Name: ${name}
+      body: JSON.stringify({
+        from: "ORIGIN Lab Website <onboarding@resend.dev>",
+        to: [toAddress],
+        reply_to: email,
+        subject: `[ORIGIN Lab Contact] ${subject || inquiryType || "New inquiry"} — from ${name}`,
+        text: `Name: ${name}
 Email: ${email}
 Institution: ${institution || "—"}
 Inquiry type: ${inquiryType || "—"}
@@ -60,7 +57,14 @@ Subject: ${subject || "—"}
 
 Message:
 ${message}`,
+      }),
     });
+
+    if (!resendResponse.ok) {
+      const errText = await resendResponse.text();
+      console.error("Resend API error:", resendResponse.status, errText);
+      return res.status(502).json({ error: "Email service rejected the message. Please try again later." });
+    }
 
     res.status(200).json({ success: true });
   } catch (err) {
