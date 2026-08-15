@@ -11,7 +11,9 @@ const CLIENT_ID = process.env.GITHUB_CLIENT_ID;
 const CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET;
 
 router.get("/", (req, res) => {
-  const redirectUri = `${req.protocol}://${req.get("host")}/auth/callback`;
+  // Always use https — Render terminates SSL at a proxy, so req.protocol
+  // can incorrectly report "http" even though the public URL is https.
+  const redirectUri = `https://${req.get("host")}/auth/callback`;
   const githubAuthUrl = `https://github.com/login/oauth/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(
     redirectUri
   )}&scope=repo,user`;
