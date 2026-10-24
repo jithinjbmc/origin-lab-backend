@@ -1,23 +1,15 @@
+// analytics.js — visitor tracking (in-memory store, survives restarts within a session)
 const express=require("express");
-const Database=require("better-sqlite3");
-const path=require("path");
 const axios=require("axios");
 const router=express.Router();
 
-const DB_PATH=process.env.ANALYTICS_DB||path.join("/tmp","analytics.db");
-let db;
-try{
-  db=new Database(DB_PATH);
-  db.exec(`CREATE TABLE IF NOT EXISTS visits(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts TEXT NOT NULL,page TEXT,referrer TEXT,ip TEXT,
-    country TEXT,country_code TEXT,city TEXT,region TEXT,isp TEXT,
-    ua TEXT,device TEXT,browser TEXT,os TEXT,is_bot INTEGER DEFAULT 0)`);
-  db.exec("CREATE INDEX IF NOT EXISTS idx_ts ON visits(ts)");
-}catch(e){console.error("Analytics DB:",e.message);}
+// In-memory visit log (resets on deploy/restart — acceptable for free tier)
+// Max 5000 entries to stay within memory limits
+const MAX_VISITS=5000;
+const visits=[];
 
 function parseUA(ua=""){
-  const bot=/bot|crawler|spider|slurp|googlebot|bingbot|duckduckbot/i.test(ua);
+  const bot=/bot|crawler|spider|slurp|googlebot|bingbot|duckduckbot|facebookexternalhit|twitterbot/i.test(ua);
   const mob=/Mobile|Android|iPhone|iPad/i.test(ua);
   const device=bot?"Bot":mob?"Mobile":"Desktop";
   let browser="Other";
@@ -32,7 +24,7 @@ function parseUA(ua=""){
   else if(/Linux/i.test(ua))os="Linux";
   else if(/Android/i.test(ua))os="Android";
   else if(/iOS|iPhone|iPad/i.test(ua))os="iOS";
-  return{device,browser,os,is_bot:bot?1:0};
+  return{device,browser,os,is_bot:bot};
 }
 
 const geoCache=new Map();
@@ -53,34 +45,60 @@ async function geoLookup(ip){
 }
 
 router.post("/",async(req,res)=>{
-  if(!db)return res.status(503).json({error:"Analytics unavailable"});
   res.status(204).end();
   const ip=((req.headers["x-forwarded-for"]||"").split(",")[0].trim()||req.socket.remoteAddress||"");
   const ua=(req.headers["user-agent"]||"").substring(0,500);
   const{page,referrer}=req.body||{};
   const{device,browser,os,is_bot}=parseUA(ua);
   const geo=await geoLookup(ip);
-  const ts=new Date().toISOString();
-  try{
-    db.prepare("INSERT INTO visits(ts,page,referrer,ip,country,country_code,city,region,isp,ua,device,browser,os,is_bot)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-      .run(ts,page||"/",referrer||"",ip,geo.country||"",geo.country_code||"",geo.city||"",geo.region||"",geo.isp||"",ua,device,browser,os,is_bot);
-  }catch(e){console.error("Analytics insert:",e.message);}
+  const entry={
+    id:visits.length+1,
+    ts:new Date().toISOString(),
+    page:page||"/",
+    referrer:referrer||"",
+    ip,
+    country:geo.country||"",
+    country_code:geo.country_code||"",
+    city:geo.city||"",
+    region:geo.region||"",
+    isp:geo.isp||"",
+    ua,device,browser,os,is_bot
+  };
+  visits.unshift(entry);
+  if(visits.length>MAX_VISITS)visits.pop();
 });
 
 router.get("/data",(req,res)=>{
-  if(!db)return res.status(503).json({error:"Analytics unavailable"});
   const secret=req.headers["x-analytics-secret"]||req.query.secret||"";
   const expected=process.env.ANALYTICS_SECRET||"";
   if(!expected||secret!==expected)return res.status(401).json({error:"Unauthorised"});
+
   const limit=Math.min(parseInt(req.query.limit)||500,2000);
-  const offset=parseInt(req.query.offset)||0;
-  const rows=db.prepare("SELECT * FROM visits ORDER BY ts DESC LIMIT ? OFFSET ?").all(limit,offset);
-  const total=db.prepare("SELECT COUNT(*) as n FROM visits").get().n;
-  const summary=db.prepare("SELECT country,country_code,COUNT(*) as visits FROM visits WHERE is_bot=0 AND country!='' GROUP BY country ORDER BY visits DESC LIMIT 20").all();
-  const pages=db.prepare("SELECT page,COUNT(*) as hits FROM visits WHERE is_bot=0 GROUP BY page ORDER BY hits DESC LIMIT 20").all();
-  const devices=db.prepare("SELECT device,COUNT(*) as n FROM visits WHERE is_bot=0 GROUP BY device ORDER BY n DESC").all();
-  const browsers=db.prepare("SELECT browser,COUNT(*) as n FROM visits WHERE is_bot=0 GROUP BY browser ORDER BY n DESC").all();
-  const daily=db.prepare("SELECT substr(ts,1,10) as date,COUNT(*) as visits FROM visits WHERE is_bot=0 GROUP BY date ORDER BY date DESC LIMIT 30").all();
+  const rows=visits.slice(0,limit);
+  const total=visits.length;
+  const human=visits.filter(v=>!v.is_bot);
+
+  // Country summary
+  const countryMap={};
+  human.forEach(v=>{if(v.country){countryMap[v.country]=countryMap[v.country]||{country:v.country,country_code:v.country_code,visits:0};countryMap[v.country].visits++;}});
+  const summary=Object.values(countryMap).sort((a,b)=>b.visits-a.visits).slice(0,20);
+
+  // Page summary
+  const pageMap={};
+  human.forEach(v=>{pageMap[v.page]=(pageMap[v.page]||0)+1;});
+  const pages=Object.entries(pageMap).map(([page,hits])=>({page,hits})).sort((a,b)=>b.hits-a.hits).slice(0,20);
+
+  // Device/browser
+  const devMap={};human.forEach(v=>{devMap[v.device]=(devMap[v.device]||0)+1;});
+  const devices=Object.entries(devMap).map(([device,n])=>({device,n})).sort((a,b)=>b.n-a.n);
+  const brMap={};human.forEach(v=>{brMap[v.browser]=(brMap[v.browser]||0)+1;});
+  const browsers=Object.entries(brMap).map(([browser,n])=>({browser,n})).sort((a,b)=>b.n-a.n);
+
+  // Daily
+  const dayMap={};
+  human.forEach(v=>{const d=v.ts.substring(0,10);dayMap[d]=(dayMap[d]||0)+1;});
+  const daily=Object.entries(dayMap).map(([date,visits])=>({date,visits})).sort((a,b)=>b.date.localeCompare(a.date)).slice(0,30);
+
   res.json({total,rows,summary,pages,devices,browsers,daily});
 });
 
